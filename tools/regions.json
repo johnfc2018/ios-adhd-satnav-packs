@@ -1,0 +1,14 @@
+[
+  {
+    "id": "isle-of-man",
+    "name": "Isle of Man (test region)",
+    "pbf": "https://download.geofabrik.de/europe/isle-of-man-latest.osm.pbf",
+    "bbox": "-4.9,54.0,-4.2,54.5"
+  },
+  {
+    "id": "london-south-east",
+    "name": "London & South East",
+    "pbf": "https://download.geofabrik.de/europe/united-kingdom/england/greater-london-latest.osm.pbf https://download.geofabrik.de/europe/united-kingdom/england/kent-latest.osm.pbf https://download.geofabrik.de/europe/united-kingdom/england/surrey-latest.osm.pbf https://download.geofabrik.de/europe/united-kingdom/england/east-sussex-latest.osm.pbf https://download.geofabrik.de/europe/united-kingdom/england/west-sussex-latest.osm.pbf https://download.geofabrik.de/europe/united-kingdom/england/hampshire-latest.osm.pbf https://download.geofabrik.de/europe/united-kingdom/england/berkshire-latest.osm.pbf https://download.geofabrik.de/europe/united-kingdom/england/buckinghamshire-latest.osm.pbf https://download.geofabrik.de/europe/united-kingdom/england/oxfordshire-latest.osm.pbf https://download.geofabrik.de/europe/united-kingdom/england/hertfordshire-latest.osm.pbf https://download.geofabrik.de/europe/united-kingdom/england/essex-latest.osm.pbf",
+    "bbox": "-2.0,50.5,1.6,52.2"
+  }
+]

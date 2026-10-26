@@ -1,0 +1,82 @@
+name: Build and publish region packs
+# Builds one region's offline packs and publishes them as release assets in this repository.
+# Also updates the "manifest" release, whose regions.json is the address the app reads.
+on:
+  workflow_dispatch:
+    inputs:
+      region:
+        description: Region id from tools/regions.json
+        default: london-south-east
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install tools
+        run: |
+          pip install osmium
+          gh release download -R protomaps/go-pmtiles -p '*Linux_x86_64.tar.gz' -D /tmp/pmtiles
+          tar -xzf /tmp/pmtiles/*.tar.gz -C /tmp/pmtiles
+          sudo install /tmp/pmtiles/pmtiles /usr/local/bin/pmtiles
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: Read region definition
+        id: region
+        env:
+          REGION: ${{ inputs.region }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os
+          r = next(r for r in json.load(open("tools/regions.json")) if r["id"] == os.environ["REGION"])
+          for k in ("id", "name", "pbf", "bbox"):
+              print(f"{k}={r[k]}")
+          PY
+      - name: Build packs
+        run: tools/build_packs.sh "${{ steps.region.outputs.id }}" "${{ steps.region.outputs.pbf }}" "${{ steps.region.outputs.bbox }}" "out/${{ steps.region.outputs.id }}"
+      - name: Sanity checks
+        run: |
+          d="out/${{ steps.region.outputs.id }}"
+          test -s "$d/routing.tar" && test -s "$d/map.pmtiles" && test -s "$d/index.sqlite"
+          python3 - "$d/index.sqlite" <<'PY'
+          import sqlite3, sys
+          db = sqlite3.connect(sys.argv[1])
+          for t in ("cameras", "ways", "places"):
+              print(t, db.execute(f"select count(*) from {t}").fetchone()[0])
+          assert db.execute("select count(*) from ways").fetchone()[0] > 0
+          assert db.execute("select count(*) from places").fetchone()[0] > 0
+          PY
+          pmtiles show "$d/map.pmtiles" | head -12
+          tar -tf "$d/routing.tar" | head -3
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          id="${{ steps.region.outputs.id }}"
+          d="out/$id"
+          date="$(cat $d/DATE)"
+          tag="$id-$date"
+          repo="${{ github.repository }}"
+
+          # Start from the published manifest so other regions are kept.
+          curl -fsL "https://github.com/$repo/releases/download/manifest/regions.json" -o "$d/regions.json" || true
+          python3 tools/make_manifest.py "$d/regions.json" --id "$id" \
+            --name "${{ steps.region.outputs.name }}" --bbox "${{ steps.region.outputs.bbox }}" \
+            --date "$date" --base-url "https://github.com/$repo/releases/download/$tag" \
+            routing="$d/routing.tar" map="$d/map.pmtiles" index="$d/index.sqlite"
+
+          gh release delete "$tag" --yes --cleanup-tag >/dev/null 2>&1 || true
+          gh release create "$tag" --title "$tag" \
+            --notes "Offline packs for ${{ steps.region.outputs.name }}. Map data © OpenStreetMap contributors (ODbL); basemap by Protomaps." \
+            "$d/routing.tar" "$d/map.pmtiles" "$d/index.sqlite"
+
+          gh release view manifest >/dev/null 2>&1 || \
+            gh release create manifest --title "Region manifest" --notes "Latest regions.json read by the app."
+          gh release upload manifest "$d/regions.json" --clobber
+          echo "Manifest: https://github.com/$repo/releases/download/manifest/regions.json"
