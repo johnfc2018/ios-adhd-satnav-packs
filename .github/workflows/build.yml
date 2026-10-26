@@ -67,7 +67,7 @@ jobs:
           # Start from the published manifest so other regions are kept.
           curl -fsL "https://github.com/$repo/releases/download/manifest/regions.json" -o "$d/regions.json" || true
           python3 tools/make_manifest.py "$d/regions.json" --id "$id" \
-            --name "${{ steps.region.outputs.name }}" --bbox "${{ steps.region.outputs.bbox }}" \
+            --name "${{ steps.region.outputs.name }}" --bbox="${{ steps.region.outputs.bbox }}" \
             --date "$date" --base-url "https://github.com/$repo/releases/download/$tag" \
             routing="$d/routing.tar" map="$d/map.pmtiles" index="$d/index.sqlite"
 
