@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Build index.sqlite for one region from an OSM .pbf.
+"""Build one index.sqlite per region from OSM .pbf files, in a single pass over the data.
 
-Tables
+Tables (per region database)
   meta(key, value)
   cameras(id, lat, lon, limit_kph, direction, kind)
   ways(id, kind, value, geom)        kind 'limit' (value = km/h) or 'lit' (value = 1); geom = polyline6
@@ -9,7 +9,8 @@ Tables
   localities(name, kind, lat, lon, importance)   towns/villages/suburbs, for "where am I"
   places                             FTS5 gazetteer: places, named streets, postcodes, POIs
 
-Usage: build_index.py --out index.sqlite [--date YYYY-MM-DD] region.osm.pbf [more.osm.pbf ...]
+Usage: build_index.py --date YYYY-MM-DD --region ID:minLon,minLat,maxLon,maxLat:OUT.sqlite [--region ...] a.osm.pbf [b.osm.pbf ...]
+       build_index.py --out OUT.sqlite [--date D] a.osm.pbf       (one region covering everything)
 Requires: pip install osmium
 """
 import argparse
@@ -27,6 +28,7 @@ DRIVABLE = {
 LIT_VALUES = {"yes", "24/7", "automatic", "sunset-sunrise", "limited"}
 PLACE_IMPORTANCE = {"city": 100, "town": 80, "suburb": 55, "village": 60, "hamlet": 40,
                     "neighbourhood": 35, "locality": 30}
+SETTLEMENTS = ("city", "town", "village", "suburb", "hamlet")
 POI_KEYS = ("amenity", "shop", "tourism", "leisure")
 MPH = 1.609344
 
@@ -76,83 +78,65 @@ def encode_polyline(points, precision=6):
     return "".join(out)
 
 
-class Handler(osmium.SimpleHandler):
-    def __init__(self, db):
-        super().__init__()
-        self.db = db
+class Sink:
+    """Everything that goes into one region's database."""
+
+    def __init__(self, region_id, bbox, path, date):
+        self.id = region_id
+        self.min_lon, self.min_lat, self.max_lon, self.max_lat = bbox
+        self.path = path
+        self.date = date
+        self.db = sqlite3.connect(path)
+        self.db.executescript("""
+            PRAGMA journal_mode = OFF;
+            PRAGMA synchronous = OFF;
+            DROP TABLE IF EXISTS meta; DROP TABLE IF EXISTS cameras; DROP TABLE IF EXISTS ways;
+            DROP TABLE IF EXISTS way_rtree; DROP TABLE IF EXISTS places; DROP TABLE IF EXISTS localities;
+            CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
+            CREATE TABLE cameras(id INTEGER PRIMARY KEY, lat REAL, lon REAL, limit_kph REAL, direction REAL, kind TEXT);
+            CREATE TABLE ways(id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, value REAL, geom TEXT);
+            CREATE TABLE localities(name TEXT, kind TEXT, lat REAL, lon REAL, importance REAL);
+            CREATE INDEX localities_lat ON localities(lat);
+            CREATE VIRTUAL TABLE way_rtree USING rtree(id, min_lat, max_lat, min_lon, max_lon);
+            CREATE VIRTUAL TABLE places USING fts5(
+                name, locality, kind UNINDEXED, lat UNINDEXED, lon UNINDEXED, importance UNINDEXED,
+                tokenize = 'unicode61 remove_diacritics 2', prefix = '2 3 4');
+        """)
         self.postcodes = {}   # postcode -> [sum_lat, sum_lon, n]
         self.streets = {}     # (name, lat cell, lon cell) -> (name, lat, lon, locality)
-        self.grid = {}        # (lat*10, lon*10) -> [(lat, lon, name)] of towns/villages, to label streets
+        self.grid = {}        # (lat*10, lon*10) -> [(lat, lon, name)] of settlements, to label streets
         self.counts = {"cameras": 0, "limit": 0, "lit": 0, "places": 0}
 
-    # -- nodes: cameras, places, POIs, postcodes
-    def node(self, n):
-        if not n.location.valid():
-            return
-        t = n.tags
-        lat, lon = n.location.lat, n.location.lon
-        if t.get("highway") == "speed_camera" or t.get("enforcement") in ("maxspeed", "average_speed"):
-            limit = parse_kph(t.get("maxspeed", ""))
-            direction = parse_direction(t.get("direction") or t.get("camera:direction") or "")
-            kind = "average" if t.get("enforcement") == "average_speed" else "fixed"
-            self.db.execute("INSERT OR REPLACE INTO cameras VALUES (?,?,?,?,?,?)",
-                            (n.id, lat, lon, limit, direction, kind))
-            self.counts["cameras"] += 1
-        name = t.get("name")
-        if name:
-            place = t.get("place")
-            if place in PLACE_IMPORTANCE:
-                self.add_place(name, "", place, lat, lon, PLACE_IMPORTANCE[place])
-                self.db.execute("INSERT INTO localities VALUES (?,?,?,?,?)",
-                                (name, place, lat, lon, PLACE_IMPORTANCE[place]))
-                if place in ("city", "town", "village", "suburb", "hamlet"):
-                    self.grid.setdefault((int(lat * 10), int(lon * 10)), []).append((lat, lon, name))
-            elif any(k in t for k in POI_KEYS):
-                kind = next(t[k] for k in POI_KEYS if k in t)
-                self.add_place(name, t.get("addr:city", ""), kind, lat, lon, 20)
-        self.note_postcode(t, lat, lon)
+    def has_point(self, lat, lon):
+        return self.min_lat <= lat <= self.max_lat and self.min_lon <= lon <= self.max_lon
 
-    # -- ways: limits, lit, named streets, postcodes
-    def way(self, w):
-        t = w.tags
-        highway = t.get("highway")
-        pts = []
-        if highway in DRIVABLE or "addr:postcode" in t:
-            try:
-                pts = [(nd.lat, nd.lon) for nd in w.nodes if nd.location.valid()]
-            except osmium.InvalidLocationError:
-                return
-        if not pts:
-            return
-        if highway in DRIVABLE:
-            if len(pts) > 1:
-                kph = parse_kph(t.get("maxspeed", ""), highway) if "maxspeed" in t else None
-                if kph:
-                    self.add_way("limit", kph, pts)
-                    self.counts["limit"] += 1
-                if t.get("lit", "").lower() in LIT_VALUES:
-                    self.add_way("lit", 1.0, pts)
-                    self.counts["lit"] += 1
-            name = t.get("name")
-            if name:
-                mid = pts[len(pts) // 2]
-                key = (name.lower(), round(mid[0], 2), round(mid[1], 2))
-                if key not in self.streets:
-                    self.streets[key] = (name, mid[0], mid[1], t.get("addr:city", ""))
-        self.note_postcode(t, pts[0][0], pts[0][1])
+    def touches(self, min_lat, max_lat, min_lon, max_lon):
+        return (min_lat <= self.max_lat and max_lat >= self.min_lat
+                and min_lon <= self.max_lon and max_lon >= self.min_lon)
 
-    def add_way(self, kind, value, pts):
-        cur = self.db.execute("INSERT INTO ways(kind, value, geom) VALUES (?,?,?)",
-                              (kind, value, encode_polyline(pts)))
-        lats = [p[0] for p in pts]
-        lons = [p[1] for p in pts]
-        self.db.execute("INSERT INTO way_rtree VALUES (?,?,?,?,?)",
-                        (cur.lastrowid, min(lats), max(lats), min(lons), max(lons)))
+    def add_camera(self, osm_id, lat, lon, limit, direction, kind):
+        self.db.execute("INSERT OR REPLACE INTO cameras VALUES (?,?,?,?,?,?)", (osm_id, lat, lon, limit, direction, kind))
+        self.counts["cameras"] += 1
+
+    def add_way(self, kind, value, pts, bounds):
+        cur = self.db.execute("INSERT INTO ways(kind, value, geom) VALUES (?,?,?)", (kind, value, encode_polyline(pts)))
+        self.db.execute("INSERT INTO way_rtree VALUES (?,?,?,?,?)", (cur.lastrowid, *bounds))
+        self.counts[kind] += 1
 
     def add_place(self, name, locality, kind, lat, lon, importance):
         self.db.execute("INSERT INTO places(name, locality, kind, lat, lon, importance) VALUES (?,?,?,?,?,?)",
                         (name, locality, kind, lat, lon, importance))
         self.counts["places"] += 1
+
+    def add_locality(self, name, kind, lat, lon):
+        self.db.execute("INSERT INTO localities VALUES (?,?,?,?,?)", (name, kind, lat, lon, PLACE_IMPORTANCE[kind]))
+        if kind in SETTLEMENTS:
+            self.grid.setdefault((int(lat * 10), int(lon * 10)), []).append((lat, lon, name))
+
+    def note_street(self, name, lat, lon, locality):
+        key = (name.lower(), round(lat, 2), round(lon, 2))
+        if key not in self.streets:
+            self.streets[key] = (name, lat, lon, locality)
 
     def note_postcode(self, tags, lat, lon):
         pc = tags.get("addr:postcode")
@@ -175,45 +159,105 @@ class Handler(osmium.SimpleHandler):
 
     def finish(self):
         for name, lat, lon, locality in self.streets.values():
-            locality = locality or self.nearest_locality(lat, lon)
-            self.add_place(name, locality, "street", lat, lon, 30)
+            self.add_place(name, locality or self.nearest_locality(lat, lon), "street", lat, lon, 30)
         for pc, (sl, so, n) in self.postcodes.items():
             self.add_place(pc, "", "postcode", sl / n, so / n, 35)
+        self.db.execute("INSERT INTO meta VALUES ('schema', ?)", (str(SCHEMA_VERSION),))
+        self.db.execute("INSERT INTO meta VALUES ('date', ?)", (self.date,))
+        self.db.commit()
+        self.db.execute("VACUUM")
+        self.db.close()
+        print(f"{self.id}: {self.counts} postcodes={len(self.postcodes)} streets={len(self.streets)}", file=sys.stderr)
+
+
+class Handler(osmium.SimpleHandler):
+    def __init__(self, sinks):
+        super().__init__()
+        self.sinks = sinks
+
+    def node(self, n):
+        t = n.tags
+        if not t or not n.location.valid():
+            return
+        lat, lon = n.location.lat, n.location.lon
+        targets = [s for s in self.sinks if s.has_point(lat, lon)]
+        if not targets:
+            return
+        name = t.get("name")
+        is_camera = t.get("highway") == "speed_camera" or t.get("enforcement") in ("maxspeed", "average_speed")
+        for s in targets:
+            if is_camera:
+                limit = parse_kph(t.get("maxspeed", ""))
+                direction = parse_direction(t.get("direction") or t.get("camera:direction") or "")
+                kind = "average" if t.get("enforcement") == "average_speed" else "fixed"
+                s.add_camera(n.id, lat, lon, limit, direction, kind)
+            if name:
+                place = t.get("place")
+                if place in PLACE_IMPORTANCE:
+                    s.add_place(name, "", place, lat, lon, PLACE_IMPORTANCE[place])
+                    s.add_locality(name, place, lat, lon)
+                elif any(k in t for k in POI_KEYS):
+                    kind = next(t[k] for k in POI_KEYS if k in t)
+                    s.add_place(name, t.get("addr:city", ""), kind, lat, lon, 20)
+            s.note_postcode(t, lat, lon)
+
+    def way(self, w):
+        t = w.tags
+        highway = t.get("highway")
+        if highway not in DRIVABLE and "addr:postcode" not in t:
+            return
+        try:
+            pts = [(nd.lat, nd.lon) for nd in w.nodes if nd.location.valid()]
+        except osmium.InvalidLocationError:
+            return
+        if not pts:
+            return
+        lats = [p[0] for p in pts]
+        lons = [p[1] for p in pts]
+        bounds = (min(lats), max(lats), min(lons), max(lons))
+        targets = [s for s in self.sinks if s.touches(*bounds)]
+        if not targets:
+            return
+
+        kph = parse_kph(t["maxspeed"], highway) if highway in DRIVABLE and "maxspeed" in t else None
+        lit = highway in DRIVABLE and t.get("lit", "").lower() in LIT_VALUES
+        name = t.get("name") if highway in DRIVABLE else None
+        mid = pts[len(pts) // 2]
+        for s in targets:
+            if len(pts) > 1:
+                if kph:
+                    s.add_way("limit", kph, pts, bounds)
+                if lit:
+                    s.add_way("lit", 1.0, pts, bounds)
+            if name and s.has_point(*mid):
+                s.note_street(name, mid[0], mid[1], t.get("addr:city", ""))
+            if s.has_point(*pts[0]):
+                s.note_postcode(t, pts[0][0], pts[0][1])
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("pbf", nargs="+")
-    ap.add_argument("--out", required=True)
+    ap.add_argument("--out")
+    ap.add_argument("--region", action="append", default=[], help="ID:minLon,minLat,maxLon,maxLat:OUT.sqlite")
     ap.add_argument("--date", default="")
     args = ap.parse_args()
 
-    db = sqlite3.connect(args.out)
-    db.executescript("""
-        PRAGMA journal_mode = OFF;
-        PRAGMA synchronous = OFF;
-        DROP TABLE IF EXISTS meta; DROP TABLE IF EXISTS cameras; DROP TABLE IF EXISTS ways;
-        DROP TABLE IF EXISTS way_rtree; DROP TABLE IF EXISTS places; DROP TABLE IF EXISTS localities;
-        CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
-        CREATE TABLE cameras(id INTEGER PRIMARY KEY, lat REAL, lon REAL, limit_kph REAL, direction REAL, kind TEXT);
-        CREATE TABLE ways(id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, value REAL, geom TEXT);
-        CREATE TABLE localities(name TEXT, kind TEXT, lat REAL, lon REAL, importance REAL);
-        CREATE INDEX localities_lat ON localities(lat);
-        CREATE VIRTUAL TABLE way_rtree USING rtree(id, min_lat, max_lat, min_lon, max_lon);
-        CREATE VIRTUAL TABLE places USING fts5(
-            name, locality, kind UNINDEXED, lat UNINDEXED, lon UNINDEXED, importance UNINDEXED,
-            tokenize = 'unicode61 remove_diacritics 2', prefix = '2 3 4');
-    """)
-    h = Handler(db)
+    sinks = []
+    for spec in args.region:
+        rid, bbox, path = spec.split(":", 2)
+        sinks.append(Sink(rid, tuple(float(x) for x in bbox.split(",")), path, args.date))
+    if args.out:
+        sinks.append(Sink("all", (-180, -90, 180, 90), args.out, args.date))
+    if not sinks:
+        sys.exit("give --region or --out")
+
+    handler = Handler(sinks)
     for pbf in args.pbf:
-        h.apply_file(pbf, locations=True, idx="flex_mem")
-    h.finish()
-    db.execute("INSERT INTO meta VALUES ('schema', ?)", (str(SCHEMA_VERSION),))
-    db.execute("INSERT INTO meta VALUES ('date', ?)", (args.date,))
-    db.commit()
-    db.execute("VACUUM")
-    db.close()
-    print("index built:", h.counts, "postcodes:", len(h.postcodes), "streets:", len(h.streets), file=sys.stderr)
+        # A sparse in-memory node index suits country-sized extracts whose node ids are scattered.
+        handler.apply_file(pbf, locations=True, idx="sparse_mem_array")
+    for s in sinks:
+        s.finish()
 
 
 if __name__ == "__main__":

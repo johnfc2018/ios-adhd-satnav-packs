@@ -1,0 +1,15 @@
+{
+  "pbf": ["https://download.geofabrik.de/europe/united-kingdom-latest.osm.pbf"],
+  "regions": [
+    {"id": "london-south-east", "name": "London & South East", "bbox": "-2.0,50.5,1.8,52.2"},
+    {"id": "south-west", "name": "South West England", "bbox": "-6.6,49.8,-2.0,52.2"},
+    {"id": "wales", "name": "Wales", "bbox": "-5.8,51.3,-2.6,53.5"},
+    {"id": "midlands", "name": "Midlands", "bbox": "-2.7,52.0,0.4,53.6"},
+    {"id": "east-anglia", "name": "East Anglia", "bbox": "0.4,52.0,1.8,53.2"},
+    {"id": "north-west-england", "name": "North West England", "bbox": "-3.7,53.0,-2.0,55.2"},
+    {"id": "north-east-england", "name": "Yorkshire & North East", "bbox": "-3.0,53.0,0.3,55.9"},
+    {"id": "southern-scotland", "name": "Southern Scotland", "bbox": "-7.2,54.6,-1.5,56.5"},
+    {"id": "highlands-islands", "name": "Highlands & Islands", "bbox": "-8.7,56.5,-0.7,60.9"},
+    {"id": "northern-ireland", "name": "Northern Ireland", "bbox": "-8.3,54.0,-5.3,55.4"}
+  ]
+}

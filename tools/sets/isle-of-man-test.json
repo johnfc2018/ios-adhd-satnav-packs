@@ -1,0 +1,7 @@
+{
+  "pbf": ["https://download.geofabrik.de/europe/isle-of-man-latest.osm.pbf"],
+  "regions": [
+    {"id": "iom-north", "name": "Isle of Man North (test)", "bbox": "-4.9,54.2,-4.2,54.5"},
+    {"id": "iom-south", "name": "Isle of Man South (test)", "bbox": "-4.9,54.0,-4.2,54.25"}
+  ]
+}
