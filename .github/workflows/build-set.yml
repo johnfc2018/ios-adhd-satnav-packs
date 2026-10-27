@@ -2,6 +2,8 @@ name: Build a set of regions
 # Builds several regions from one OSM extract (so their routing tiles come from a single graph build)
 # and, if asked, publishes each as a release and updates the manifest the app reads.
 on:
+  schedule:
+    - cron: "0 3 2 * *"   # monthly: rebuild the whole UK set from fresh OSM data and publish it
   workflow_dispatch:
     inputs:
       set:
@@ -38,11 +40,14 @@ jobs:
           sudo install /tmp/pmtiles/pmtiles /usr/local/bin/pmtiles
         env:
           GH_TOKEN: ${{ github.token }}
+      - name: Check the regions leave no gaps
+        if: ${{ (inputs.set || 'uk') == 'uk' }}
+        run: python3 tools/check_coverage.py tools/sets/uk.json
       - name: Build
         env:
           GH_TOKEN: ${{ github.token }}
-          SET_NAME: ${{ inputs.set }}
-          PUBLISH: ${{ inputs.publish }}
+          SET_NAME: ${{ inputs.set || 'uk' }}
+          PUBLISH: ${{ github.event_name == 'schedule' && 'true' || inputs.publish }}
           ONLY: ${{ inputs.only }}
         run: |
           args=(tools/build_set.py "tools/sets/$SET_NAME.json" --out out)
